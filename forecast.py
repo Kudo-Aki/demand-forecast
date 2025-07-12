@@ -139,8 +139,9 @@ def main() -> None:
 
         for idx, name in enumerate(item_names):
             try:
-                sales_vec = item_rows.iloc[idx, 1:][valid_mask]          # 各日の販売数
-                sales_series = pd.Series(sales_vec.values, index=dates)
+                sales_vec = item_rows.iloc[idx, 1:][valid_mask].replace('', np.nan)
+                sales_series = pd.Series(pd.to_numeric(sales_vec, errors='coerce'),
+                         index=dates).fillna(0)
                 preds = predict_series(sales_series, FORECAST_DAYS)      # ndarray
                 pred_dict[name] = preds
                 # ---- 昨日の誤差ログ ----
