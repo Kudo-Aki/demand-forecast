@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # ==================================================================
-# 需要予測フル版 2025-07  ── recency-weighted learning & accuracy log
+# 需要予測フル版 2025-07  – recency-weighted & accuracy log (FIX)
 # ==================================================================
 import os, json, base64, re, unicodedata, logging, warnings
 from datetime import date, timedelta, datetime
@@ -13,8 +13,8 @@ SID          = os.getenv("GSHEET_ID")
 SA_JSON      = os.getenv("GSPREAD_SA_JSON")
 DB_SHEET     = os.getenv("DB_SHEET",      "データベース")
 FC_SHEET     = os.getenv("FORECAST_SHEET","需要予測")
-HIST_SHEET   = os.getenv("HISTORY_SHEET", "予測履歴")   # new
-METRIC_SHEET = os.getenv("METRIC_SHEET",  "予測精度")   # new
+HIST_SHEET   = os.getenv("HISTORY_SHEET", "予測履歴")
+METRIC_SHEET = os.getenv("METRIC_SHEET",  "予測精度")
 FORECAST_D   = int(os.getenv("FORECAST_DAYS", 7))
 LABEL_ROWS   = int(os.getenv("LABEL_ROWS", 10))
 LAT, LON     = 36.3740, 140.5662
@@ -76,7 +76,7 @@ def rokuyo(start, days):
     base = datetime(1900,1,1)
     return [ROKUYO[((start+timedelta(i))-base.date()).days % 6] for i in range(days)]
 
-# ---------- モデル（最近データ重み ↑） ----------
+# ---------- モデル ----------
 def cat_predict(y: pd.Series,
                 X_extra: pd.DataFrame,
                 Xf_extra: pd.DataFrame) -> np.ndarray:
@@ -86,22 +86,23 @@ def cat_predict(y: pd.Series,
         return np.zeros(len(Xf_extra))
 
     # --- 基本特徴
-    X  = pd.DataFrame(index=idx)
-    Xf = pd.DataFrame(index=Xf_extra.index)
-    X["dow"] = idx.weekday.astype(int)
-    X["mon"] = idx.month.astype(int)
-    X["doy"] = idx.dayofyear.astype(int)
-    Xf["dow"] = Xf.index.weekday.astype(int)
-    Xf["mon"] = Xf.index.month.astype(int)
-    Xf["doy"] = Xf.index.dayofyear.astype(int)
+    X  = pd.DataFrame({
+        "dow": idx.weekday.astype(int),
+        "mon": idx.month.astype(int),
+        "doy": idx.dayofyear.astype(int)
+    }, index=idx)
+    Xf = pd.DataFrame({
+        "dow": Xf_extra.index.weekday.astype(int),
+        "mon": Xf_extra.index.month.astype(int),
+        "doy": Xf_extra.index.dayofyear.astype(int)
+    }, index=Xf_extra.index)
 
     X  = X.join(X_extra.reindex(idx))
     Xf = Xf.join(Xf_extra)
 
-    # ----------★ recency-weight ----------
-    span = (idx.max() - idx.min()).days or 1
-    w = 1 + (idx - idx.min()).days / span      # 1.0〜2.0 線形ウェイト
-    # ------------------------------------
+    # ----------★ recency weight : numpy array -------------
+    w = np.linspace(1.0, 2.0, len(idx))      # ← ndarray なので OK
+    # ------------------------------------------------------
 
     model = CatBoostRegressor(
         depth=8, learning_rate=0.1,
@@ -129,7 +130,6 @@ def main():
     r_sales = fuzzy_row(wide, "売上");  r_cust  = fuzzy_row(wide, "客数")
     r_unit  = fuzzy_row(wide, "客単価"); r_tmax  = fuzzy_row(wide, "最高気温")
     r_tmin  = fuzzy_row(wide, "最低気温"); r_wtxt = fuzzy_row(wide, "天気")
-
     wcode_hist = wide.loc[r_wtxt].replace(W2C).astype(float) if r_wtxt else pd.Series(index=wide.columns, dtype=float)
 
     # --- 未来外生
@@ -184,44 +184,39 @@ def main():
     # ---------- 2) 予測履歴シートに追記 ----------
     hist_ws = sh.worksheet(HIST_SHEET) if HIST_SHEET in [w.title for w in sh.worksheets()] \
               else sh.add_worksheet(HIST_SHEET, rows=1, cols=5)
-    if hist_ws.row_count == 0:
+    if hist_ws.row_count == 0 or hist_ws.cell(1,1).value != "run_date":
         hist_ws.update("A1", [["run_date","target_date","label","pred"]])
 
     run_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    append_rows = []
-    for lbl in labels:
-        for td, val in zip(fut_idx, preds[lbl]):
-            append_rows.append([run_date, td.strftime("%Y-%m-%d"), lbl, float(val)])
-    hist_ws.append_rows(append_rows, value_input_option="USER_ENTERED")
+    hist_rows = [[run_date, td.strftime("%Y-%m-%d"), lbl, float(val)]
+                 for lbl in labels for td, val in zip(fut_idx, preds[lbl])]
+    hist_ws.append_rows(hist_rows, value_input_option="USER_ENTERED")
 
-    # ---------- 3) 精度レポート (実績 vs 予測) ----------
-    #   昨日以前で、履歴 + 実績どちらもある行のみ評価
+    # ---------- 3) 精度レポート ----------
     hist_df = pd.DataFrame(hist_ws.get_all_values()[1:], columns=["run","target","label","pred"])
     hist_df["target"] = pd.to_datetime(hist_df["target"])
     hist_df["pred"]   = pd.to_numeric(hist_df["pred"], errors="coerce")
-    actual_map = wide.to_dict(orient="index")  # label→Series
-    records=[]
-    cutoff = date.today()                      # 今日より前が評価対象
+    actual_map = wide.to_dict(orient="index")
+
+    rec=[]; cutoff=date.today()
     for _, r in hist_df.iterrows():
         if r["target"].date() >= cutoff: continue
-        lab = r["label"]; d = r["target"]
+        lab=r["label"]; d=r["target"]
         if lab in actual_map and d in actual_map[lab]:
-            act = actual_map[lab][d]
+            act=actual_map[lab][d]
             if pd.notna(act):
-                err = abs(act - r["pred"])
-                ape = err / act * 100 if act else np.nan
-                records.append([lab, err, ape])
-    if records:
-        res = pd.DataFrame(records, columns=["label","ae","ape"])
-        report = (res.groupby("label")
-                       .agg(MAE=("ae","mean"), MAPE=("ape","mean"))
-                       .reset_index())
+                err=abs(act-r["pred"]); ape=err/act*100 if act else np.nan
+                rec.append([lab, err, ape])
+    if rec:
+        rep=(pd.DataFrame(rec, columns=["label","ae","ape"])
+               .groupby("label").agg(MAE=("ae","mean"),MAPE=("ape","mean"))
+               .reset_index().round(2))
         met_ws = sh.worksheet(METRIC_SHEET) if METRIC_SHEET in [w.title for w in sh.worksheets()] \
                  else sh.add_worksheet(METRIC_SHEET, rows=2000, cols=10)
         met_ws.clear()
-        met_ws.update("A1", [report.columns.tolist()]+report.round(2).values.tolist())
+        met_ws.update("A1", [rep.columns.tolist()]+rep.values.tolist())
 
-    logging.info("✅ 完了 — forecast / history / metric 更新OK")
+    logging.info("✅ 完了 — error fix & all sheets updated")
 
 if __name__ == "__main__":
     try:
