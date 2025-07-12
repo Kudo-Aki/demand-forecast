@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # =============================================================
-# 需要予測フル版 2025-07
+# 需要予測フル版 2025-07  ── fix: mask.values → mask
 # =============================================================
 import os, json, base64, re, unicodedata, logging
 from datetime import date, timedelta, datetime
@@ -8,19 +8,17 @@ import numpy as np, pandas as pd, requests, gspread
 from google.oauth2.service_account import Credentials
 from catboost import CatBoostRegressor
 
-# ---------- 0) 環境変数 ----------
-SID             = os.getenv("GSHEET_ID")                # ★必須
-SA_JSON_RAW     = os.getenv("GSPREAD_SA_JSON")          # ★必須
+SID             = os.getenv("GSHEET_ID")
+SA_JSON_RAW     = os.getenv("GSPREAD_SA_JSON")
 DB_SHEET        = os.getenv("DB_SHEET",        "データベース")
 FC_SHEET        = os.getenv("FORECAST_SHEET",  "需要予測")
 FORECAST_DAYS   = int(os.getenv("FORECAST_DAYS", 7))
 LABEL_ROWS      = int(os.getenv("LABEL_ROWS", 10))
-LAT, LON        = 36.3740, 140.5662                     # 天気座標
+LAT, LON        = 36.3740, 140.5662
 
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s")
 
-# ---------- util ----------
 def load_sa():
     raw = SA_JSON_RAW or ""
     info = json.loads(raw) if raw.lstrip().startswith("{") \
@@ -34,8 +32,7 @@ def num_clean(s: pd.Series) -> pd.Series:
          .str.replace(r"[^\d.\-]", "", regex=True)
          .str.replace("．", ".", regex=False)
          .replace("", np.nan),
-        errors="coerce")
-      .fillna(0))
+        errors="coerce").fillna(0))
 
 def weather_forecast(lat, lon, days):
     url = ("https://api.open-meteo.com/v1/forecast?"
@@ -75,27 +72,21 @@ def catboost_pred(y: pd.Series, horizon: int, extra=None):
             fut[k] = s.tail(30).mean()
     return np.clip(mdl.predict(fut), 0, None)
 
-# ---------- main ----------
 def main():
     gc = gspread.authorize(load_sa())
     ws_db = gc.open_by_key(SID).worksheet(DB_SHEET)
     raw   = ws_db.get_all_values()
-    df_db = pd.DataFrame(raw)
-    df_db.columns = df_db.iloc[0]
-    df_db = df_db.drop(0)
+    df_db = pd.DataFrame(raw); df_db.columns = df_db.iloc[0]; df_db = df_db.drop(0)
 
-    # 日付列抽出
     date_cols = pd.to_datetime(df_db.columns[1:], errors="coerce")
     mask = ~date_cols.isna()
     dates = date_cols[mask]
 
-    # wide テーブル
-    wide = df_db.set_index(df_db.columns[0])        # ← 重複 drop を削除
-    wide = wide.iloc[:, mask.values]                # 日付列のみ
+    wide = df_db.set_index(df_db.columns[0])
+    wide = wide.iloc[:, mask]          # ← 修正
     wide.columns = dates
     wide = wide.apply(num_clean, axis=1)
 
-    # 予報 & 六曜
     start = date.today() + timedelta(1)
     fut_dates = pd.date_range(start, periods=FORECAST_DAYS)
     wdf = weather_forecast(LAT, LON, FORECAST_DAYS).reindex(
@@ -106,20 +97,16 @@ def main():
         "tmax": wide.get("最高気温", pd.Series(index=dates)),
         "tmin": wide.get("最低気温", pd.Series(index=dates)),
     }
-
-    targets = ["売上", "客数", "客単価"] + list(
+    targets = ["売上","客数","客単価"] + list(
         wide.index.drop(["売上","客数","客単価"], errors="ignore"))
     pred = {n: catboost_pred(wide.loc[n], FORECAST_DAYS, extra) for n in targets}
 
-    # ---------- Sheets 出力 ----------
     sh = gc.open_by_key(SID)
     ws_fc = (sh.worksheet(FC_SHEET) if FC_SHEET in [w.title for w in sh.worksheets()]
              else sh.add_worksheet(FC_SHEET, rows=2000, cols=400))
     ws_fc.resize(rows=LABEL_ROWS + len(targets), cols=1 + FORECAST_DAYS)
 
-    # ヘッダ
     ws_fc.update("A1", [["日付"] + [d.strftime("%Y/%m/%d") for d in fut_dates]])
-
     meta = [
         ["曜日"]      + ["月火水木金土日"[d.weekday()] for d in fut_dates],
         ["六曜"]      + rokuyo_seq,
@@ -132,12 +119,10 @@ def main():
     ]
     ws_fc.update("A2", meta)
 
-    # 集計
     for i, row in enumerate(["売上","客数","客単価"], start=8):
         ws_fc.update_cell(i, 1, row)
         ws_fc.update(f"B{i}", [pred[row].round(1).tolist()])
 
-    # 授与品
     start_row = LABEL_ROWS + 1
     ws_fc.update(f"A{start_row}", [[r] for r in targets[3:]])
     ws_fc.update(f"B{start_row}",
