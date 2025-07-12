@@ -2,7 +2,7 @@ name: demand-forecast
 
 on:
   schedule:
-    - cron: '0 8 * * *'   # UTC08:00 = JST17:00
+    - cron: '30 9 * * *'   # UTC08:00 = JST17:00
   workflow_dispatch:
 
 jobs:
