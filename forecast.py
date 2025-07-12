@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # =============================================================
-# 需要予測フル版 2025-07  – feature-rich forecast
+# 需要予測フル版 2025-07  – final fix (cat features as int)
 # =============================================================
 import os, json, base64, re, unicodedata, logging, warnings
 from datetime import date, timedelta, datetime
@@ -15,7 +15,7 @@ DB_SHEET    = os.getenv("DB_SHEET", "データベース")
 FC_SHEET    = os.getenv("FORECAST_SHEET", "需要予測")
 FORECAST_D  = int(os.getenv("FORECAST_DAYS", 7))
 LABEL_ROWS  = int(os.getenv("LABEL_ROWS", 10))
-LAT, LON    = 36.3740, 140.5662                       # 天気 API 座標
+LAT, LON    = 36.3740, 140.5662
 
 META_ROWS = ["曜日","六曜","年中行事","天気","最高気温","最低気温"]
 
@@ -49,13 +49,12 @@ def fuzzy_row(df, key):
             return r
     return None
 
-def ensure_series(x):          # DataFrame → 先頭行
+def ensure_series(x):
     return x.iloc[0] if isinstance(x, pd.DataFrame) else x
 
-# ★ テキスト→天気コード対応（Open-Meteo に合わせる簡易版）
-W2C = {"快晴":0,"晴":1,"薄曇":2,"曇":3,"霧":45,"霧雨":51,
-       "小雨":61,"雨":63,"大雨":65,"小雪":71,"雪":73,"大雪":75,
-       "にわか雨":80,"雷雨":95,"—":np.nan,"ｰ":np.nan,"":np.nan}
+W2C = {"快晴":0,"晴":1,"薄曇":2,"曇":3,"霧":45,"霧雨":51,"小雨":61,"雨":63,
+       "大雨":65,"小雪":71,"雪":73,"大雪":75,"にわか雨":80,"雷雨":95,
+       "—":np.nan,"ｰ":np.nan,"":np.nan}
 
 def weather_forecast(days):
     url = (f"https://api.open-meteo.com/v1/forecast?"
@@ -79,26 +78,27 @@ def rokuyo(start, days):
 def cat_predict(y: pd.Series,
                 X_extra: pd.DataFrame,
                 Xf_extra: pd.DataFrame) -> np.ndarray:
-    """y: Series (hist) / X_extra: same index / Xf_extra: future index"""
     y = ensure_series(y).astype(float)
     idx = y.dropna().index
     if idx.empty or float(y.sum()) == 0:
         return np.zeros(len(Xf_extra))
 
-    X = pd.DataFrame({
-        "dow": idx.weekday,
-        "mon": idx.month,
-        "doy": idx.dayofyear,
-    }, index=idx).join(X_extra.reindex(idx))
+    # --- 基本特徴
+    X  = pd.DataFrame(index=idx)
+    Xf = pd.DataFrame(index=Xf_extra.index)
+    X["dow"] = idx.weekday.astype(int)
+    X["mon"] = idx.month.astype(int)
+    X["doy"] = idx.dayofyear.astype(int)
+    Xf["dow"] = Xf.index.weekday.astype(int)
+    Xf["mon"] = Xf.index.month.astype(int)
+    Xf["doy"] = Xf.index.dayofyear.astype(int)
 
-    Xf = pd.DataFrame({
-        "dow": Xf_extra.index.weekday,
-        "mon": Xf_extra.index.month,
-        "doy": Xf_extra.index.dayofyear,
-    }, index=Xf_extra.index).join(Xf_extra)
+    # --- 外生
+    X  = X.join(X_extra.reindex(idx))
+    Xf = Xf.join(Xf_extra)
 
-    # weekday, month, weather code をカテゴリ扱い
-    cat_cols = [0,1] + ([X.columns.get_loc("code")] if "code" in X.columns else [])
+    # dow, mon をカテゴリとして扱う（必ず int 型）
+    cat_cols = ["dow","mon"]
 
     model = CatBoostRegressor(
         depth=8, learning_rate=0.1,
@@ -109,32 +109,25 @@ def cat_predict(y: pd.Series,
 
 # ---------- main ----------
 def main():
-    # --- read DB sheet
     gc  = gspread.authorize(creds())
     df0 = pd.DataFrame(gc.open_by_key(SID).worksheet(DB_SHEET).get_all_values())
-    df0.columns, df = df0.iloc[0], df0.drop(0)
+    df0.columns; df = df0.drop(0)
+    df.columns = df0.iloc[0]
 
     dates = pd.to_datetime(df.columns[1:], errors="coerce")
-    valid = ~dates.isna()
-    wide  = df.set_index(df.columns[0]).iloc[:, valid]
-    wide.columns = dates[valid]
+    wide  = df.set_index(df.columns[0]).iloc[:, ~dates.isna()]
+    wide.columns = dates[~dates.isna()]
     wide = wide.apply(num_clean, axis=1)
 
-    # --- locate rows
     r_sales = fuzzy_row(wide, "売上")
     r_cust  = fuzzy_row(wide, "客数")
     r_unit  = fuzzy_row(wide, "客単価")
     r_tmax  = fuzzy_row(wide, "最高気温")
     r_tmin  = fuzzy_row(wide, "最低気温")
-    r_wtxt  = fuzzy_row(wide, "天気")   # 文字天気をコード化
+    r_wtxt  = fuzzy_row(wide, "天気")
 
-    # --- weather to numeric
-    if r_wtxt:
-        wcode_hist = wide.loc[r_wtxt].replace(W2C).astype(float)
-    else:
-        wcode_hist = pd.Series(index=wide.columns, dtype=float)
+    wcode_hist = wide.loc[r_wtxt].replace(W2C).astype(float) if r_wtxt else pd.Series(index=wide.columns, dtype=float)
 
-    # --- future exogenous vars
     start   = date.today()+timedelta(1)
     fut_idx = pd.date_range(start, periods=FORECAST_D)
     wdf     = weather_forecast(FORECAST_D).reindex(fut_idx, method="nearest")
@@ -145,14 +138,12 @@ def main():
         "tmin": wdf["tmin"].astype(float)
     }, index=fut_idx)
 
-    # --- historical exogenous
     X_extra = pd.DataFrame({
         "code": wcode_hist,
         "tmax": ensure_series(wide.loc[r_tmax]) if r_tmax else np.nan,
         "tmin": ensure_series(wide.loc[r_tmin]) if r_tmin else np.nan
     })
 
-    # --- targets
     agg_lbls = ["売上","客数","客単価"]
     agg_rows = [r_sales, r_cust, r_unit]
     item_rows = [r for r in wide.index
@@ -162,10 +153,10 @@ def main():
 
     preds = {l: cat_predict(wide.loc[r], X_extra, Xf_extra) for l,r in zip(labels,rows)}
 
-    # ---------- write sheet (batch)
-    sh  = gc.open_by_key(SID)
-    ws  = sh.worksheet(FC_SHEET) if FC_SHEET in [w.title for w in sh.worksheets()] \
-          else sh.add_worksheet(FC_SHEET, rows=2000, cols=400)
+    # --- write sheet（2 回書込で quota 回避）
+    sh = gc.open_by_key(SID)
+    ws = sh.worksheet(FC_SHEET) if FC_SHEET in [w.title for w in sh.worksheets()] \
+         else sh.add_worksheet(FC_SHEET, rows=2000, cols=400)
     ws.resize(rows=LABEL_ROWS+len(labels), cols=1+FORECAST_D)
 
     header = [["日付"]+[d.strftime("%Y/%m/%d") for d in fut_idx]]
@@ -188,7 +179,7 @@ def main():
                            else arr.round().astype(int)).tolist())
     ws.update(range_name=f"A{LABEL_ROWS+1}", values=body)
 
-    logging.info("✅ 完了 — feature-rich forecast written")
+    logging.info("✅ 完了 — 型エラー修正 & 予測書込")
 
 if __name__ == "__main__":
     try:
