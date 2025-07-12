@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # ==================================================================
-# 需要予測フル版 2025-07  – recency-weighted & accuracy log (FIX)
+# 需要予測フル版 2025-07 – recency-weighted & accuracy log (dup-index fix)
 # ==================================================================
 import os, json, base64, re, unicodedata, logging, warnings
 from datetime import date, timedelta, datetime
@@ -51,7 +51,7 @@ def fuzzy_row(df, key):
             return r
     return None
 
-def ensure_series(x):
+def ensure_series(x):          # DataFrame → 先頭行
     return x.iloc[0] if isinstance(x, pd.DataFrame) else x
 
 W2C = {"快晴":0,"晴":1,"薄曇":2,"曇":3,"霧":45,"霧雨":51,"小雨":61,"雨":63,
@@ -85,29 +85,23 @@ def cat_predict(y: pd.Series,
     if idx.empty or float(y.sum()) == 0:
         return np.zeros(len(Xf_extra))
 
-    # --- 基本特徴
     X  = pd.DataFrame({
         "dow": idx.weekday.astype(int),
         "mon": idx.month.astype(int),
         "doy": idx.dayofyear.astype(int)
-    }, index=idx)
+    }, index=idx).join(X_extra.reindex(idx))
+
     Xf = pd.DataFrame({
         "dow": Xf_extra.index.weekday.astype(int),
         "mon": Xf_extra.index.month.astype(int),
         "doy": Xf_extra.index.dayofyear.astype(int)
-    }, index=Xf_extra.index)
+    }, index=Xf_extra.index).join(Xf_extra)
 
-    X  = X.join(X_extra.reindex(idx))
-    Xf = Xf.join(Xf_extra)
+    w = np.linspace(1.0, 2.0, len(idx))         # ndarray OK
 
-    # ----------★ recency weight : numpy array -------------
-    w = np.linspace(1.0, 2.0, len(idx))      # ← ndarray なので OK
-    # ------------------------------------------------------
-
-    model = CatBoostRegressor(
-        depth=8, learning_rate=0.1,
-        loss_function="RMSE", random_state=42,
-        verbose=False)
+    model = CatBoostRegressor(depth=8, learning_rate=0.1,
+                              loss_function="RMSE",
+                              random_state=42, verbose=False)
     model.fit(X, y.loc[idx], sample_weight=w, cat_features=["dow","mon"])
     return np.clip(model.predict(Xf), 0, None)
 
@@ -156,7 +150,7 @@ def main():
     labels = agg_lbls + item_rows;       rows = agg_rows + item_rows
     preds  = {l: cat_predict(wide.loc[r], X_extra, Xf_extra) for l,r in zip(labels,rows)}
 
-    # ---------- 1) 需要予測シート一括更新 ----------
+    # ---------- 1) 需要予測シート ----------
     ws = sh.worksheet(FC_SHEET) if FC_SHEET in [w.title for w in sh.worksheets()] \
          else sh.add_worksheet(FC_SHEET, rows=2000, cols=400)
     ws.resize(rows=LABEL_ROWS+len(labels), cols=1+FORECAST_D)
@@ -172,20 +166,19 @@ def main():
         ["最高気温"] + wdf["tmax"].round(1).tolist(),
         ["最低気温"] + wdf["tmin"].round(1).tolist()
     ]
-    ws.update(range_name="A1", values=header+meta)
+    ws.update(values=header+meta, range_name="A1")
 
-    body=[]
-    for lbl in labels:
-        arr = preds[lbl]
-        body.append([lbl]+(arr.round(1) if lbl in agg_lbls
-                           else arr.round().astype(int)).tolist())
-    ws.update(range_name=f"A{LABEL_ROWS+1}", values=body)
+    body=[[lbl]+(preds[lbl].round(1) if lbl in agg_lbls
+                 else preds[lbl].round().astype(int)).tolist()
+          for lbl in labels]
+    ws.update(values=body, range_name=f"A{LABEL_ROWS+1}")
 
-    # ---------- 2) 予測履歴シートに追記 ----------
+    # ---------- 2) 予測履歴 ----------
     hist_ws = sh.worksheet(HIST_SHEET) if HIST_SHEET in [w.title for w in sh.worksheets()] \
               else sh.add_worksheet(HIST_SHEET, rows=1, cols=5)
     if hist_ws.row_count == 0 or hist_ws.cell(1,1).value != "run_date":
-        hist_ws.update("A1", [["run_date","target_date","label","pred"]])
+        hist_ws.update(values=[["run_date","target_date","label","pred"]],
+                       range_name="A1")
 
     run_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     hist_rows = [[run_date, td.strftime("%Y-%m-%d"), lbl, float(val)]
@@ -193,10 +186,17 @@ def main():
     hist_ws.append_rows(hist_rows, value_input_option="USER_ENTERED")
 
     # ---------- 3) 精度レポート ----------
-    hist_df = pd.DataFrame(hist_ws.get_all_values()[1:], columns=["run","target","label","pred"])
+    hist_df = pd.DataFrame(hist_ws.get_all_values()[1:],
+                           columns=["run","target","label","pred"])
     hist_df["target"] = pd.to_datetime(hist_df["target"])
     hist_df["pred"]   = pd.to_numeric(hist_df["pred"], errors="coerce")
-    actual_map = wide.to_dict(orient="index")
+
+    # ★ duplicate-index safe dict
+    actual_map = {
+        lab: ensure_series(wide.loc[lab]) if lab in wide.index
+             else pd.Series(index=wide.columns, dtype=float)
+        for lab in wide.index.unique()
+    }
 
     rec=[]; cutoff=date.today()
     for _, r in hist_df.iterrows():
@@ -214,9 +214,10 @@ def main():
         met_ws = sh.worksheet(METRIC_SHEET) if METRIC_SHEET in [w.title for w in sh.worksheets()] \
                  else sh.add_worksheet(METRIC_SHEET, rows=2000, cols=10)
         met_ws.clear()
-        met_ws.update("A1", [rep.columns.tolist()]+rep.values.tolist())
+        met_ws.update(values=[rep.columns.tolist()]+rep.values.tolist(),
+                      range_name="A1")
 
-    logging.info("✅ 完了 — error fix & all sheets updated")
+    logging.info("✅ 完了 — duplicate-index fix & all sheets updated")
 
 if __name__ == "__main__":
     try:
