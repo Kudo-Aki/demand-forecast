@@ -1,0 +1,5 @@
+gspread
+google-auth==2.38.0
+catboost
+pandas
+numpy
