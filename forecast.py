@@ -77,14 +77,22 @@ def rokuyo(start, days):
     return [ROKUYO[((start+timedelta(i))-base.date()).days % 6] for i in range(days)]
 
 # ---------- モデル ----------
+# ---------- モデル ----------
 def cat_predict(y: pd.Series,
                 X_extra: pd.DataFrame,
                 Xf_extra: pd.DataFrame) -> np.ndarray:
-    y = ensure_series(y).astype(float)
-    idx = y.dropna().index
+    """
+    ① 天気コード(code) を CatBoost のカテゴリ特徴量に追加  
+    ② 直近の予測履歴と実績を突き合わせ、誤差±3万円以上の日だけ
+       sample_weight を 2.0 にブースト
+    """
+    # ---------------- 基本準備 ----------------
+    y   = ensure_series(y).astype(float)
+    idx = y.dropna().index                    # 学習に使う日付
     if idx.empty or float(y.sum()) == 0:
         return np.zeros(len(Xf_extra))
 
+    # 学習 / 予測用特徴量 ---------------------
     X  = pd.DataFrame({
         "dow": idx.weekday.astype(int),
         "mon": idx.month.astype(int),
@@ -97,13 +105,57 @@ def cat_predict(y: pd.Series,
         "doy": Xf_extra.index.dayofyear.astype(int)
     }, index=Xf_extra.index).join(Xf_extra)
 
-    w = np.linspace(1.0, 2.0, len(idx))         # ndarray OK
+    # ---------------- 重み計算 ----------------
+    # 既定の recency weight
+    w = np.linspace(1.0, 2.0, len(idx))
 
-    model = CatBoostRegressor(depth=8, learning_rate=0.1,
-                              loss_function="RMSE",
-                              random_state=42, verbose=False)
-    model.fit(X, y.loc[idx], sample_weight=w, cat_features=["dow","mon"])
+    # 予測履歴を（初回のみ）キャッシュして取得
+    if not hasattr(cat_predict, "_hist_df"):
+        try:
+            gc = gspread.authorize(creds())
+            sh = gc.open_by_key(SID)
+            if HIST_SHEET in [ws.title for ws in sh.worksheets()]:
+                rows = sh.worksheet(HIST_SHEET).get_all_values()[1:]  # ヘッダ除く
+                cat_predict._hist_df = pd.DataFrame(
+                    rows, columns=["run", "target", "label", "pred"])
+                cat_predict._hist_df["run"]    = pd.to_datetime(cat_predict._hist_df["run"])
+                cat_predict._hist_df["target"] = pd.to_datetime(cat_predict._hist_df["target"])
+                cat_predict._hist_df["pred"]   = pd.to_numeric(cat_predict._hist_df["pred"],
+                                                               errors="coerce")
+            else:
+                cat_predict._hist_df = pd.DataFrame()
+        except Exception:                       # 取得失敗 → 空 DataFrame
+            cat_predict._hist_df = pd.DataFrame()
+
+    hist = cat_predict._hist_df
+    if not hist.empty:
+        # 対象ラベルの最新予測を日付単位で抽出
+        h = (hist[hist["label"] == y.name]
+                .sort_values("run")                   # run日時で昇順
+                .drop_duplicates(subset="target", keep="last")
+                .set_index("target")["pred"])
+
+        # 誤差が±30,000円以上の日だけ weight=2.0
+        for i, d in enumerate(idx):
+            if d in h.index:
+                err = abs(y.loc[d] - h.loc[d])
+                if err >= 30000:
+                    w[i] = 2.0
+
+    # ---------------- 学習 --------------------
+    cat_feats = [c for c in ["dow", "mon", "code"] if c in X.columns]
+    model = CatBoostRegressor(
+        depth=8,
+        learning_rate=0.1,
+        loss_function="RMSE",
+        random_state=42,
+        verbose=False
+    )
+    model.fit(X, y.loc[idx], sample_weight=w, cat_features=cat_feats)
+
+    # ---------------- 予測 --------------------
     return np.clip(model.predict(Xf), 0, None)
+
 
 # ---------- main ----------
 def main():
