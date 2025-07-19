@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 # ==================================================================
-# 需要予測フル版 2025-07 – recency-weighted & accuracy log (dup-index fix)
+# 需要予測フル版 2025-07  (Tomorrow→7日 / 誤差連続重み / 履歴 & 精度)
 # ==================================================================
-import os, json, base64, re, unicodedata, logging, warnings
+import os, json, base64, re, unicodedata, logging, warnings, time
 from datetime import date, timedelta, datetime
 import numpy as np, pandas as pd, requests, gspread
 from google.oauth2.service_account import Credentials
@@ -11,14 +11,19 @@ from catboost import CatBoostRegressor
 # ---------- 設定 ----------
 SID          = os.getenv("GSHEET_ID")
 SA_JSON      = os.getenv("GSPREAD_SA_JSON")
-DB_SHEET     = os.getenv("DB_SHEET",      "データベース")
-FC_SHEET     = os.getenv("FORECAST_SHEET","需要予測")
-HIST_SHEET   = os.getenv("HISTORY_SHEET", "予測履歴")
-METRIC_SHEET = os.getenv("METRIC_SHEET",  "予測精度")
-FORECAST_D   = int(os.getenv("FORECAST_DAYS", 7))
+DB_SHEET     = os.getenv("DB_SHEET",       "データベース")
+FC_SHEET     = os.getenv("FORECAST_SHEET", "需要予測")
+HIST_SHEET   = os.getenv("HISTORY_SHEET",  "予測履歴")
+METRIC_SHEET = os.getenv("METRIC_SHEET",   "予測精度")
+FORECAST_D   = int(os.getenv("FORECAST_DAYS", 7))          # 明日を含めて n 日
 LABEL_ROWS   = int(os.getenv("LABEL_ROWS", 10))
+ERR_WEIGHT_SCALE = float(os.getenv("ERR_WEIGHT_SCALE", 30000))
+ERR_WEIGHT_CAP   = float(os.getenv("ERR_WEIGHT_CAP", 1.0))
+
+# 緯度経度（ひたちなか）
 LAT, LON     = 36.3740, 140.5662
 
+# メタ行（予測シート上で “品目” として扱わないラベル）
 META_ROWS = ["曜日","六曜","年中行事","天気","最高気温","最低気温"]
 
 logging.basicConfig(level=logging.INFO,
@@ -28,21 +33,20 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # ---------- util ----------
 def creds():
     raw = SA_JSON or ""
-    data = json.loads(raw) if raw.lstrip().startswith("{") \
-           else json.loads(base64.b64decode(raw))
+    data = json.loads(raw) if raw.lstrip().startswith("{") else json.loads(base64.b64decode(raw))
     return Credentials.from_service_account_info(
         data, scopes=["https://www.googleapis.com/auth/spreadsheets"])
 
 def num_clean(s):
     return (pd.to_numeric(
-        s.astype(str).str.replace(r"[^\d.\-]", "", regex=True)
+        s.astype(str)
+         .str.replace(r"[^\d.\-]", "", regex=True)
          .str.replace("．", ".", regex=False)
          .replace("", np.nan),
-        errors="coerce").fillna(0))
+         errors="coerce").fillna(0))
 
 def norm(t):
-    return re.sub(r"[ 　【】\[\]\(\)]", "",
-                  unicodedata.normalize("NFKC", str(t))).lower()
+    return re.sub(r"[ 　【】\[\]\(\)]", "", unicodedata.normalize("NFKC", str(t))).lower()
 
 def fuzzy_row(df, key):
     nk = norm(key)
@@ -51,19 +55,20 @@ def fuzzy_row(df, key):
             return r
     return None
 
-def ensure_series(x):          # DataFrame → 先頭行
+def ensure_series(x):
     return x.iloc[0] if isinstance(x, pd.DataFrame) else x
 
+# 天気表記→コード（履歴側）
 W2C = {"快晴":0,"晴":1,"薄曇":2,"曇":3,"霧":45,"霧雨":51,"小雨":61,"雨":63,
        "大雨":65,"小雪":71,"雪":73,"大雪":75,"にわか雨":80,"雷雨":95,
-       "—":np.nan,"ｰ":np.nan,"":np.nan}
+       "—":np.nan,"ｰ":np.nan,"":np.nan,"－":np.nan}
 
 def weather_forecast(days):
     url = (f"https://api.open-meteo.com/v1/forecast?"
            f"latitude={LAT}&longitude={LON}"
            "&daily=weathercode,temperature_2m_max,temperature_2m_min"
            "&timezone=Asia%2FTokyo")
-    d = requests.get(url, timeout=10).json()["daily"]
+    d = requests.get(url, timeout=15).json()["daily"]
     return (pd.DataFrame({
         "dt":   pd.to_datetime(d["time"]),
         "code": d["weathercode"],
@@ -77,23 +82,21 @@ def rokuyo(start, days):
     return [ROKUYO[((start+timedelta(i))-base.date()).days % 6] for i in range(days)]
 
 # ---------- モデル ----------
-# ---------- モデル ----------
 def cat_predict(y: pd.Series,
                 X_extra: pd.DataFrame,
                 Xf_extra: pd.DataFrame) -> np.ndarray:
     """
-    ① 天気コード(code) を CatBoost のカテゴリ特徴量に追加  
-    ② 直近の予測履歴と実績を突き合わせ、誤差±3万円以上の日だけ
-       sample_weight を 2.0 にブースト
+    ① 天気コード(code)をカテゴリ特徴として利用
+    ② 時系列後半を強調する recency weight (1.0→2.0)
+    ③ 過去予測との誤差を滑らかに反映（誤差比例重み: 1 + min(err/SCALE, CAP)）
     """
-    # ---------------- 基本準備 ----------------
-    y   = ensure_series(y).astype(float)
-    idx = y.dropna().index                    # 学習に使う日付
+    y = ensure_series(y).astype(float)
+    idx = y.dropna().index
     if idx.empty or float(y.sum()) == 0:
         return np.zeros(len(Xf_extra))
 
-    # 学習 / 予測用特徴量 ---------------------
-    X  = pd.DataFrame({
+    # ---- 特徴量（学習 / 予測） ----
+    X = pd.DataFrame({
         "dow": idx.weekday.astype(int),
         "mon": idx.month.astype(int),
         "doy": idx.dayofyear.astype(int)
@@ -105,45 +108,45 @@ def cat_predict(y: pd.Series,
         "doy": Xf_extra.index.dayofyear.astype(int)
     }, index=Xf_extra.index).join(Xf_extra)
 
-    # ---------------- 重み計算 ----------------
-    # 既定の recency weight
-    w = np.linspace(1.0, 2.0, len(idx))
+    # ---- 基本重み：recency ----
+    n = len(idx)
+    recency_w = np.linspace(1.0, 2.0, n)
+    error_factor = np.ones(n)
 
-    # 予測履歴を（初回のみ）キャッシュして取得
+    # ---- 過去予測履歴取得（キャッシュ） ----
     if not hasattr(cat_predict, "_hist_df"):
         try:
             gc = gspread.authorize(creds())
             sh = gc.open_by_key(SID)
             if HIST_SHEET in [ws.title for ws in sh.worksheets()]:
-                rows = sh.worksheet(HIST_SHEET).get_all_values()[1:]  # ヘッダ除く
-                cat_predict._hist_df = pd.DataFrame(
-                    rows, columns=["run", "target", "label", "pred"])
+                rows = sh.worksheet(HIST_SHEET).get_all_values()[1:]
+                cat_predict._hist_df = pd.DataFrame(rows,
+                                    columns=["run","target","label","pred"])
                 cat_predict._hist_df["run"]    = pd.to_datetime(cat_predict._hist_df["run"])
                 cat_predict._hist_df["target"] = pd.to_datetime(cat_predict._hist_df["target"])
                 cat_predict._hist_df["pred"]   = pd.to_numeric(cat_predict._hist_df["pred"],
                                                                errors="coerce")
             else:
                 cat_predict._hist_df = pd.DataFrame()
-        except Exception:                       # 取得失敗 → 空 DataFrame
+        except Exception:
             cat_predict._hist_df = pd.DataFrame()
 
     hist = cat_predict._hist_df
     if not hist.empty:
-        # 対象ラベルの最新予測を日付単位で抽出
+        # ラベル別の最新予測を target 日ごとに統合
         h = (hist[hist["label"] == y.name]
-                .sort_values("run")                   # run日時で昇順
+                .sort_values("run")
                 .drop_duplicates(subset="target", keep="last")
                 .set_index("target")["pred"])
-
-        # 誤差が±30,000円以上の日だけ weight=2.0
         for i, d in enumerate(idx):
             if d in h.index:
                 err = abs(y.loc[d] - h.loc[d])
-                if err >= 30000:
-                    w[i] = 2.0
+                error_factor[i] = 1.0 + min(err / ERR_WEIGHT_SCALE, ERR_WEIGHT_CAP)
 
-    # ---------------- 学習 --------------------
-    cat_feats = [c for c in ["dow", "mon", "code"] if c in X.columns]
+    w = recency_w * error_factor
+
+    cat_feats = [c for c in ["dow","mon","code"] if c in X.columns]
+
     model = CatBoostRegressor(
         depth=8,
         learning_rate=0.1,
@@ -152,34 +155,40 @@ def cat_predict(y: pd.Series,
         verbose=False
     )
     model.fit(X, y.loc[idx], sample_weight=w, cat_features=cat_feats)
-
-    # ---------------- 予測 --------------------
     return np.clip(model.predict(Xf), 0, None)
-
 
 # ---------- main ----------
 def main():
+    logging.info("=== 需要予測開始 ===")
     gc  = gspread.authorize(creds())
     sh  = gc.open_by_key(SID)
 
-    # --- データベース読み込み
-    df0 = pd.DataFrame(sh.worksheet(DB_SHEET).get_all_values())
-    df0.columns; df = df0.drop(0)
+    # --- データベース読み込み ---
+    db_ws = sh.worksheet(DB_SHEET)
+    raw = db_ws.get_all_values()
+    if not raw or len(raw) < 2:
+        raise RuntimeError("データベースシートに十分なデータがありません。")
+
+    df0 = pd.DataFrame(raw)
+    df  = df0.drop(0)
     df.columns = df0.iloc[0]
 
-    dates = pd.to_datetime(df.columns[1:], errors="coerce")
-    wide  = df.set_index(df.columns[0]).iloc[:, ~dates.isna()]
-    wide.columns = dates[~dates.isna()]
+    # 列（日付）抽出
+    date_cols = pd.to_datetime(df.columns[1:], errors="coerce")
+    wide = df.set_index(df.columns[0]).iloc[:, ~date_cols.isna()]
+    wide.columns = date_cols[~date_cols.isna()]
     wide = wide.apply(num_clean, axis=1)
 
-    # --- 行を特定
-    r_sales = fuzzy_row(wide, "売上");  r_cust  = fuzzy_row(wide, "客数")
-    r_unit  = fuzzy_row(wide, "客単価"); r_tmax  = fuzzy_row(wide, "最高気温")
-    r_tmin  = fuzzy_row(wide, "最低気温"); r_wtxt = fuzzy_row(wide, "天気")
+    # --- 代表行（売上など）特定 ---
+    r_sales = fuzzy_row(wide, "売上");   r_cust  = fuzzy_row(wide, "客数")
+    r_unit  = fuzzy_row(wide, "客単価")
+    r_tmax  = fuzzy_row(wide, "最高気温")
+    r_tmin  = fuzzy_row(wide, "最低気温")
+    r_wtxt  = fuzzy_row(wide, "天気")
     wcode_hist = wide.loc[r_wtxt].replace(W2C).astype(float) if r_wtxt else pd.Series(index=wide.columns, dtype=float)
 
-    # --- 未来外生
-    start   = date.today()+timedelta(1)
+    # --- 未来外生（明日から FORECAST_D 日） ---
+    start   = date.today() + timedelta(1)
     fut_idx = pd.date_range(start, periods=FORECAST_D)
     wdf     = weather_forecast(FORECAST_D).reindex(fut_idx, method="nearest")
 
@@ -195,84 +204,120 @@ def main():
         "tmin": ensure_series(wide.loc[r_tmin]) if r_tmin else np.nan
     })
 
-    # --- 予測
-    agg_lbls = ["売上","客数","客単価"];    agg_rows = [r_sales, r_cust, r_unit]
+    # --- 予測対象ラベル ---
+    agg_lbls = ["売上","客数","客単価"]; agg_rows = [r_sales, r_cust, r_unit]
     item_rows = [r for r in wide.index
-                 if r not in META_ROWS+agg_lbls and not norm(r).startswith("天気")]
-    labels = agg_lbls + item_rows;       rows = agg_rows + item_rows
-    preds  = {l: cat_predict(wide.loc[r], X_extra, Xf_extra) for l,r in zip(labels,rows)}
+                 if r not in META_ROWS + agg_lbls and r is not None and not norm(r).startswith("天気")]
+    labels = agg_lbls + item_rows
+    rows   = agg_rows + item_rows
 
-    # ---------- 1) 需要予測シート ----------
-    ws = sh.worksheet(FC_SHEET) if FC_SHEET in [w.title for w in sh.worksheets()] \
-         else sh.add_worksheet(FC_SHEET, rows=2000, cols=400)
-    ws.resize(rows=LABEL_ROWS+len(labels), cols=1+FORECAST_D)
+    # --- 予測実行 ---
+    preds = {}
+    for lbl, r in zip(labels, rows):
+        if r is None:
+            preds[lbl] = np.zeros(len(fut_idx))
+        else:
+            preds[lbl] = cat_predict(wide.loc[r], X_extra, Xf_extra)
 
-    header = [["日付"]+[d.strftime("%Y/%m/%d") for d in fut_idx]]
-    meta   = [
-        ["曜日"] + ["月火水木金土日"[d.weekday()] for d in fut_idx],
-        ["六曜"] + rokuyo(start, FORECAST_D),
+    # ---------- 1) 需要予測シート更新 ----------
+    if FC_SHEET in [w.title for w in sh.worksheets()]:
+        ws = sh.worksheet(FC_SHEET)
+    else:
+        ws = sh.add_worksheet(FC_SHEET, rows=2000, cols=400)
+
+    # 必要サイズ確保
+    ws.resize(rows=LABEL_ROWS + len(labels), cols=1 + FORECAST_D)
+
+    header = [["日付"] + [d.strftime("%Y/%m/%d") for d in fut_idx]]
+    meta = [
+        ["曜日"]     + ["月火水木金土日"[d.weekday()] for d in fut_idx],
+        ["六曜"]     + rokuyo(start, FORECAST_D),
         ["年中行事"] + [""]*FORECAST_D,
-        ["天気"] + wdf["code"].map({
+        ["天気"]     + wdf["code"].map({
             0:"快晴",1:"晴",2:"薄曇",3:"曇",45:"霧",51:"霧雨",61:"小雨",
-            63:"雨",65:"大雨",71:"雪",75:"大雪",80:"にわか雨",95:"雷雨"}).fillna("－").tolist(),
+            63:"雨",65:"大雨",71:"雪",75:"大雪",80:"にわか雨",95:"雷雨"
+        }).fillna("－").tolist(),
         ["最高気温"] + wdf["tmax"].round(1).tolist(),
         ["最低気温"] + wdf["tmin"].round(1).tolist()
     ]
-    ws.update(values=header+meta, range_name="A1")
+    ws.update(values=header + meta, range_name="A1")
 
-    body=[[lbl]+(preds[lbl].round(1) if lbl in agg_lbls
+    body = [
+        [lbl] + (preds[lbl].round(1) if lbl in agg_lbls
                  else preds[lbl].round().astype(int)).tolist()
-          for lbl in labels]
+        for lbl in labels
+    ]
     ws.update(values=body, range_name=f"A{LABEL_ROWS+1}")
+    logging.info("需要予測シート更新完了")
 
-    # ---------- 2) 予測履歴 ----------
-    hist_ws = sh.worksheet(HIST_SHEET) if HIST_SHEET in [w.title for w in sh.worksheets()] \
-              else sh.add_worksheet(HIST_SHEET, rows=1, cols=5)
-    if hist_ws.row_count == 0 or hist_ws.cell(1,1).value != "run_date":
-        hist_ws.update(values=[["run_date","target_date","label","pred"]],
-                       range_name="A1")
+    # ---------- 2) 予測履歴シート ----------
+    if HIST_SHEET in [w.title for w in sh.worksheets()]:
+        hist_ws = sh.worksheet(HIST_SHEET)
+    else:
+        hist_ws = sh.add_worksheet(HIST_SHEET, rows=1, cols=5)
+
+    if hist_ws.row_count == 0 or (hist_ws.cell(1,1).value or "") != "run_date":
+        hist_ws.update(values=[["run_date","target_date","label","pred"]], range_name="A1")
 
     run_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     hist_rows = [[run_date, td.strftime("%Y-%m-%d"), lbl, float(val)]
                  for lbl in labels for td, val in zip(fut_idx, preds[lbl])]
-    hist_ws.append_rows(hist_rows, value_input_option="USER_ENTERED")
+    # append_rows がたまに rate limit に当たる場合はリトライ
+    for _ in range(3):
+        try:
+            hist_ws.append_rows(hist_rows, value_input_option="USER_ENTERED")
+            break
+        except Exception as e:
+            logging.warning(f"append_rows 再試行: {e}")
+            time.sleep(2)
+    logging.info("予測履歴シート更新完了")
 
     # ---------- 3) 精度レポート ----------
-    hist_df = pd.DataFrame(hist_ws.get_all_values()[1:],
-                           columns=["run","target","label","pred"])
-    hist_df["target"] = pd.to_datetime(hist_df["target"])
-    hist_df["pred"]   = pd.to_numeric(hist_df["pred"], errors="coerce")
+    hist_vals = hist_ws.get_all_values()
+    if len(hist_vals) > 1:
+        hist_df = pd.DataFrame(hist_vals[1:], columns=["run","target","label","pred"])
+        hist_df["target"] = pd.to_datetime(hist_df["target"], errors="coerce")
+        hist_df["pred"]   = pd.to_numeric(hist_df["pred"], errors="coerce")
 
-    # ★ duplicate-index safe dict
-    actual_map = {
-        lab: ensure_series(wide.loc[lab]) if lab in wide.index
-             else pd.Series(index=wide.columns, dtype=float)
-        for lab in wide.index.unique()
-    }
+        # actual_map 構築（duplicate index 安全）
+        actual_map = {
+            lab: ensure_series(wide.loc[lab]) if lab in wide.index
+                 else pd.Series(index=wide.columns, dtype=float)
+            for lab in wide.index.unique()
+        }
 
-    rec=[]; cutoff=date.today()
-    for _, r in hist_df.iterrows():
-        if r["target"].date() >= cutoff: continue
-        lab=r["label"]; d=r["target"]
-        if lab in actual_map and d in actual_map[lab]:
-            act=actual_map[lab][d]
-            if pd.notna(act):
-                err=abs(act-r["pred"]); ape=err/act*100 if act else np.nan
-                rec.append([lab, err, ape])
-    if rec:
-        rep=(pd.DataFrame(rec, columns=["label","ae","ape"])
-               .groupby("label").agg(MAE=("ae","mean"),MAPE=("ape","mean"))
-               .reset_index().round(2))
-        met_ws = sh.worksheet(METRIC_SHEET) if METRIC_SHEET in [w.title for w in sh.worksheets()] \
-                 else sh.add_worksheet(METRIC_SHEET, rows=2000, cols=10)
-        met_ws.clear()
-        met_ws.update(values=[rep.columns.tolist()]+rep.values.tolist(),
-                      range_name="A1")
+        rec = []
+        cutoff = date.today()
+        for _, r in hist_df.iterrows():
+            # “過去日” のみ誤差評価（今日以降は実績未確定）
+            if not pd.isna(r["target"]) and r["target"].date() < cutoff:
+                lab = r["label"]; d = r["target"]
+                if lab in actual_map and d in actual_map[lab]:
+                    act = actual_map[lab][d]
+                    if pd.notna(act):
+                        err = abs(act - r["pred"])
+                        ape = err / act * 100 if act else np.nan
+                        rec.append([lab, err, ape])
+        if rec:
+            rep = (pd.DataFrame(rec, columns=["label","ae","ape"])
+                     .groupby("label")
+                     .agg(MAE=("ae","mean"), MAPE=("ape","mean"))
+                     .reset_index().round(2))
+            if METRIC_SHEET in [w.title for w in sh.worksheets()]:
+                met_ws = sh.worksheet(METRIC_SHEET)
+            else:
+                met_ws = sh.add_worksheet(METRIC_SHEET, rows=2000, cols=10)
+            met_ws.clear()
+            met_ws.update(values=[rep.columns.tolist()] + rep.values.tolist(), range_name="A1")
+            logging.info("精度レポート更新完了")
+        else:
+            logging.info("過去日実績との突合結果なし（初期段階または実績未入力）")
 
-    logging.info("✅ 完了 — duplicate-index fix & all sheets updated")
+    logging.info("✅ 完了 — 需要予測 / 履歴 / 精度レポート 更新")
 
 if __name__ == "__main__":
     try:
         main()
     except Exception:
         logging.exception("🚨 Fatal")
+        raise
