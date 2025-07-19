@@ -2,22 +2,99 @@ name: demand-forecast
 
 on:
   schedule:
-    - cron: '30 9 * * *'   # UTC08:00 = JST17:00
+    # (A) 現行: UTC 09:30 = JST 18:30
+    - cron: '30 9 * * *'
+    # (B) もし JST 17:00 にしたい場合は 08:00 UTC に変更し、上をコメントアウト
+    # - cron: '0 8 * * *'
   workflow_dispatch:
+
+concurrency:
+  group: demand-forecast
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    env:
+      # ---- 需要予測設定（環境変数） ----
+      FORECAST_DAYS: '7'
+      ERR_WEIGHT_SCALE: '30000'
+      ERR_WEIGHT_CAP: '1.0'
+      LABEL_ROWS: '10'
+      USE_VERTEX: '1'               # 0 にすると Vertex 推論をスキップ
+      VERTEX_LOCATION: 'asia-northeast1'
+      # Sheets / Vertex の両方で使うスプレッドシート ID
+      GSHEET_ID: ${{ secrets.GSHEET_ID }}
+      # Vertex プロジェクト / エンドポイント
+      VERTEX_PROJECT: ${{ secrets.VERTEX_PROJECT }}
+      VERTEX_ENDPOINT_ID: ${{ secrets.VERTEX_ENDPOINT_ID }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+            python-version: '3.11'
 
-      - run: pip install -r requirements.txt
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ runner.os }}-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            pip-${{ runner.os }}-
 
-      - run: python forecast.py
+      - name: Write Service Account (Sheets)
+        run: |
+          echo "${GSPREAD_SA_JSON}" > gspread-sa.json
         env:
-          GSHEET_ID: ${{ secrets.GSHEET_ID }}
           GSPREAD_SA_JSON: ${{ secrets.GSPREAD_SA_JSON }}
+
+      - name: Write Service Account (Vertex)
+        # Sheets と同一キーなら別ファイルでも OK
+        run: |
+          echo "${VERTEX_SA_JSON}" > vertex-sa.json
+        env:
+          VERTEX_SA_JSON: ${{ secrets.VERTEX_SA_JSON }}
+
+      - name: Export Google Credentials
+        # Vertex SDK は GOOGLE_APPLICATION_CREDENTIALS を参照
+        run: |
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$GITHUB_WORKSPACE/vertex-sa.json" >> $GITHUB_ENV
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run forecast (with retry once)
+        id: forecast
+        env:
+          # Sheets 認証文字列（Python 側で base64 or JSON 判定）
+          GSPREAD_SA_JSON: ${{ secrets.GSPREAD_SA_JSON }}
+          # ここで他の env（GSHEET_ID, FORECAST_DAYS 等）は jobs.env から継承
+        run: |
+          set -e
+          echo "== 1st attempt =="
+          if python forecast.py; then
+            echo "first_run=success" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::First attempt failed. Retrying in 15s..."
+            sleep 15
+            echo "== 2nd attempt =="
+            python forecast.py
+            echo "first_run=retry_success" >> $GITHUB_OUTPUT
+          fi
+
+      # ---- 任意：Slack 通知（使用する場合は secrets.SLACK_WEBHOOK を設定し、コメント解除） ----
+      # - name: Notify Slack on failure
+      #   if: failure()
+      #   run: |
+      #     payload=$(jq -n --arg msg ":rotating_light: demand-forecast 失敗 (Run $GITHUB_RUN_NUMBER)" '{text:$msg}')
+      #     curl -X POST -H 'Content-type: application/json' --data "$payload" $SLACK_WEBHOOK
+      #   env:
+      #     SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
