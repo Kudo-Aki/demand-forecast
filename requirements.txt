@@ -3,3 +3,5 @@ google-auth==2.38.0
 catboost
 pandas
 numpy
+google-cloud-aiplatform>=1.50.0
+requests
